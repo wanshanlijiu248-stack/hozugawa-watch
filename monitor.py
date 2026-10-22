@@ -120,7 +120,12 @@ def main():
     ap.add_argument("--test-notify", action="store_true", help="通知のテスト送信だけして終了")
     ap.add_argument("--once", action="store_true",
                     help="1回だけ確認して終了(GitHub Actions用)。空きあり=終了コード10、エラー=1")
+    ap.add_argument("--send", nargs=2, metavar=("TITLE", "MSG"), help="指定の文章を通知して終了")
     args = ap.parse_args()
+
+    if args.send:
+        notify(args.send[0], args.send[1])
+        return
 
     if args.test_notify:
         notify("通知テスト", "このメッセージが届けば通知設定はOKです")
