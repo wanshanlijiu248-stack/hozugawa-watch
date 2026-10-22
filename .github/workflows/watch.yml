@@ -6,7 +6,7 @@ on:
   workflow_dispatch:         # 手動実行ボタン用
 
 permissions:
-  actions: write             # 空き通知後に、自分自身を停止するため
+  actions: write             # 空き通知後に自分自身を停止/過去の実行結果の参照
   contents: read
 
 jobs:
@@ -34,9 +34,20 @@ jobs:
           set +e
           python monitor.py --once
           code=$?
+
           if [ "$code" -eq 10 ]; then
             echo "空きを検知して通知しました。通知の連続送信を防ぐため、この監視を停止します。"
             gh workflow disable watch.yml
             exit 0
+          fi
+
+          if [ "$code" -ne 0 ]; then
+            # 直前の完了済みの実行結果を取得
+            prev=$(gh run list --workflow watch.yml --status completed --limit 1 --json conclusion -q '.[].conclusion')
+            echo "直前の結果: $prev"
+            # 失敗の1回目だけ通知(失敗が続いても連投しない。一度成功すると、次の失敗でまた通知)
+            if [ "$prev" != "failure" ]; then
+              python monitor.py --send "⚠️ 監視エラー" "確認に失敗しました。GitHubのActionsでログを確認してください。(サイトの表示変更やアクセス制限の可能性)"
+            fi
           fi
           exit $code
