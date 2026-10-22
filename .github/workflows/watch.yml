@@ -5,8 +5,12 @@ on:
     - cron: "*/5 * * * *"   # 5分おき(混雑時は数分〜十数分遅れることがあります)
   workflow_dispatch:         # 手動実行ボタン用
 
+concurrency:
+  group: watch
+  cancel-in-progress: false   # 前の確認が終わるまで次を待たせる(重複実行の防止)
+
 permissions:
-  actions: write             # 空き通知後に自分自身を停止/過去の実行結果の参照
+  actions: write            # 空き通知後に自分自身を停止/過去の実行結果の参照
   contents: read
 
 jobs:
@@ -20,10 +24,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
       - name: Install
         run: |
           pip install playwright requests
-          playwright install --with-deps chromium
+          playwright install chromium
 
       - name: Check availability
         env:
