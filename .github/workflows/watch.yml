@@ -1,0 +1,42 @@
+name: watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5分おき(混雑時は数分〜十数分遅れることがあります)
+  workflow_dispatch:         # 手動実行ボタン用
+
+permissions:
+  actions: write             # 空き通知後に、自分自身を停止するため
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Check availability
+        env:
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python monitor.py --once
+          code=$?
+          if [ "$code" -eq 10 ]; then
+            echo "空きを検知して通知しました。通知の連続送信を防ぐため、この監視を停止します。"
+            gh workflow disable watch.yml
+            exit 0
+          fi
+          exit $code
