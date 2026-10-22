@@ -26,7 +26,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ===== 設定 =====
 URL = "https://ars-hozugawa.triplabo.jp/activity/ja/LINKTIVITY-9SUUZ"
-TARGET_YEAR, TARGET_MONTH, TARGET_DAY = 2026, 11, 30
+TARGET_YEAR, TARGET_MONTH, TARGET_DAY = 2026, 11, 25
 INTERVAL_SEC = 300          # チェック間隔(5分)。短くしすぎないこと
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")          # 例: hozugawa-1125-xxxx(推測されにくい名前に)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
