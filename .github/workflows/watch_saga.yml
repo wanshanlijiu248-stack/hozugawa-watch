@@ -1,0 +1,91 @@
+name: watch_saga
+
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"   # 5分おき(保津川の監視と1〜2分ずらしています)
+  workflow_dispatch:
+
+concurrency:
+  group: watch_saga
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  MAX_ALERTS: "30"           # 空きを検知している間、LINEを送る最大回数(上限に達したら監視を停止)
+  LABEL: "嵯峨野トロッコ 11/25 嵯峨・嵐山→亀岡"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
+
+      - name: Install
+        run: |
+          pip install playwright requests
+          playwright install chromium
+
+      - name: Check availability
+        env:
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python monitor_saga.py --once
+          code=$?
+
+          mkdir -p state
+          count=$(cat state/saga_alerts.txt 2>/dev/null || echo 0)
+
+          save_count() {
+            echo "$1" > state/saga_alerts.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/saga_alerts.txt
+            git commit -m "saga alerts=$1" >/dev/null 2>&1
+            git pull --rebase >/dev/null 2>&1
+            git push >/dev/null 2>&1
+          }
+
+          # ---- 空きあり: 回数を数えながら、繰り返しLINE通知 ----
+          if [ "$code" -eq 10 ]; then
+            count=$((count + 1))
+            python monitor_saga.py --send "🎉 ${LABEL} に空きが出ました(${count}回目の通知)" "今すぐ予約ページを開いてください!予約できたら、GitHubのActionsで watch_saga を Disable してください。"
+            save_count "$count"
+            if [ "$count" -ge "$MAX_ALERTS" ]; then
+              python monitor_saga.py --send "通知の上限に達しました(嵯峨野トロッコ)" "LINEの送信数節約のため、監視を停止します。もう一度始める場合は Actions の watch_saga を Enable してください。"
+              gh workflow disable watch_saga.yml
+            fi
+            exit 0
+          fi
+
+          # ---- 空きなし: 以前の通知回数が残っていたらリセット ----
+          if [ "$code" -eq 0 ]; then
+            if [ "$count" -ne 0 ]; then
+              save_count 0
+            fi
+            exit 0
+          fi
+
+          # ---- エラー: 失敗の1回目だけ通知(連投しない) ----
+          prev=$(gh run list --workflow watch_saga.yml --status completed --limit 1 --json conclusion -q '.[].conclusion')
+          echo "直前の結果: $prev"
+          if [ "$prev" != "failure" ]; then
+            python monitor_saga.py --send "⚠️ 監視エラー(嵯峨野トロッコ)" "確認に失敗しました。GitHubのActionsでログを確認してください。(サイトの表示変更やアクセス制限の可能性)"
+          fi
+          exit $code
