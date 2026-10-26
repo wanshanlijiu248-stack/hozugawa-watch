@@ -10,8 +10,11 @@ concurrency:
   cancel-in-progress: false   # 前の確認が終わるまで次を待たせる(重複実行の防止)
 
 permissions:
-  actions: write            # 空き通知後に自分自身を停止/過去の実行結果の参照
-  contents: read
+  actions: write             # 通知上限に達したときに自分自身を停止/過去の実行結果の参照
+  contents: write            # 通知回数のメモ(state/alerts.txt)を保存するため
+
+env:
+  MAX_ALERTS: "30"           # 空きを検知している間、LINEを送る最大回数(上限に達したら監視を停止)
 
 jobs:
   check:
@@ -45,19 +48,45 @@ jobs:
           python monitor.py --once
           code=$?
 
+          mkdir -p state
+          count=$(cat state/alerts.txt 2>/dev/null || echo 0)
+
+          save_count() {
+            echo "$1" > state/alerts.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state/alerts.txt
+            git commit -m "alerts=$1" >/dev/null 2>&1
+            git pull --rebase >/dev/null 2>&1
+            git push >/dev/null 2>&1
+          }
+
+          # ---- 空きあり: 回数を数えながら、繰り返しLINE通知 ----
           if [ "$code" -eq 10 ]; then
-            echo "空きを検知して通知しました。通知の連続送信を防ぐため、この監視を停止します。"
-            gh workflow disable watch.yml
+            if [ "$count" -lt "$MAX_ALERTS" ]; then
+              count=$((count + 1))
+              python monitor.py --send "🎉 11/25 に空きが出ました(${count}回目の通知)" "今すぐ予約ページを開いてください!"
+              save_count "$count"
+              if [ "$count" -ge "$MAX_ALERTS" ]; then
+                python monitor.py --send "通知の上限に達しました" "LINEの送信数節約のため、この空きについての通知は止めます(監視は続けます)。満席に戻ったあとに、また空きが出たら通知します。"
+              fi
+            fi
+            # 上限に達したあとは、通知せずに監視だけ続ける(止めない)
             exit 0
           fi
 
-          if [ "$code" -ne 0 ]; then
-            # 直前の完了済みの実行結果を取得
-            prev=$(gh run list --workflow watch.yml --status completed --limit 1 --json conclusion -q '.[].conclusion')
-            echo "直前の結果: $prev"
-            # 失敗の1回目だけ通知(失敗が続いても連投しない。一度成功すると、次の失敗でまた通知)
-            if [ "$prev" != "failure" ]; then
-              python monitor.py --send "⚠️ 監視エラー" "確認に失敗しました。GitHubのActionsでログを確認してください。(サイトの表示変更やアクセス制限の可能性)"
+          # ---- 空きなし: 以前の通知回数が残っていたらリセット ----
+          if [ "$code" -eq 0 ]; then
+            if [ "$count" -ne 0 ]; then
+              save_count 0
             fi
+            exit 0
+          fi
+
+          # ---- エラー: 失敗の1回目だけ通知(連投しない) ----
+          prev=$(gh run list --workflow watch.yml --status completed --limit 1 --json conclusion -q '.[].conclusion')
+          echo "直前の結果: $prev"
+          if [ "$prev" != "failure" ]; then
+            python monitor.py --send "⚠️ 監視エラー" "確認に失敗しました。GitHubのActionsでログを確認してください。(サイトの表示変更やアクセス制限の可能性)"
           fi
           exit $code
