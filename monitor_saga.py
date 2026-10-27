@@ -99,62 +99,105 @@ def find_month(page):
     return None
 
 
-def check(page, debug=False):
-    """戻り値: (status, detail)  status = 'available' | 'unavailable' | 'error'"""
-    page.goto(URL, wait_until="networkidle", timeout=60000)
-    page.wait_for_timeout(2000)
+class DirectionCheckFailed(Exception):
+    """日付は押せる(○/△)のに、進行方向ボタンの確認に失敗したときの例外。"""
 
+    def __init__(self, day_detail, reason):
+        super().__init__(reason)
+        self.day_detail = day_detail
+        self.reason = reason
+
+
+def check_once(page, debug=False):
+    """1回分の確認。戻り値: (status, detail)。日付は押せるのに方向が確認できなければ DirectionCheckFailed。"""
+    page.goto(URL, wait_until="domcontentloaded", timeout=60000)
     try:
         page.wait_for_selector(HEADER_SEL, timeout=30000)
     except PWTimeout:
         if debug:
             dump(page, "(カレンダーが出ません)")
-        return "error", "カレンダーが表示されません"
+        raise RuntimeError("カレンダーが表示されません")
+    page.wait_for_timeout(1500)  # 日付ごとの空き状況が反映されるのを待つ
 
     month = find_month(page)
     if month is None:
         if debug:
             dump(page, "(対象月なし)")
-        return "error", f"{TARGET_YEAR}年{TARGET_MONTH}月のカレンダーが見つかりません"
+        raise RuntimeError(f"{TARGET_YEAR}年{TARGET_MONTH}月のカレンダーが見つかりません")
 
+    day_btn = None
     buttons = month.locator(DAY_BTN_SEL)
     for i in range(buttons.count()):
-        btn = buttons.nth(i)
-        if btn.locator("span").first.inner_text().strip() == str(TARGET_DAY):
-            disabled = btn.is_disabled()
-            icon_cls = btn.locator("svg").first.get_attribute("class") or ""
-            mark = "×(満席)" if "sold-out" in icon_cls else ("△(残りわずか)" if "few" in icon_cls else "○(空きあり)")
-            day_detail = f"日付: disabled={disabled}, mark={mark}"
-            if debug:
-                print(day_detail)
-            # 日付自体が満席なら、どの方向も空いていない
-            if disabled or "sold-out" in icon_cls:
-                if debug:
-                    dump(page)
-                return "unavailable", day_detail
+        b = buttons.nth(i)
+        if b.locator("span").first.inner_text().strip() == str(TARGET_DAY):
+            day_btn = b
+            break
+    if day_btn is None:
+        raise RuntimeError(f"{TARGET_DAY}日のボタンが見つかりません")
 
-            # 日付を選ぶと、進行方向ボタンの有効/無効が切り替わる
-            btn.click(timeout=5000)
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(2000)
+    disabled = day_btn.is_disabled()
+    icon_cls = day_btn.locator("svg").first.get_attribute("class") or ""
+    mark = "×(満席)" if "sold-out" in icon_cls else ("△(残りわずか)" if "few" in icon_cls else "○(空きあり)")
+    day_detail = f"日付: disabled={disabled}, mark={mark}"
+    if debug:
+        print(day_detail)
 
-            plan_btn = page.get_by_role("button", name=PLAN_PATTERN)
-            if plan_btn.count() == 0:
-                if debug:
-                    dump(page, "(進行方向ボタンが見つかりません)")
-                return "error", "「嵯峨駅／嵐山駅 → 亀岡駅」のボタンが見つかりません"
-            plan = plan_btn.first
-            plan_disabled = looks_disabled(plan)
-            detail = f"{day_detail} / 嵯峨・嵐山→亀岡ボタン: {'押せない(満席)' if plan_disabled else '押せる(空きあり)'}"
-            if debug:
-                dump(page)
-                print(detail)
-                print("ボタンのHTML:", plan.evaluate("el => el.outerHTML")[:400])
-                reverse = page.get_by_role("button", name=re.compile(r"亀岡駅.{0,6}嵯峨駅"))
-                if reverse.count():
-                    print("(参考)逆方向のボタンのHTML:", reverse.first.evaluate("el => el.outerHTML")[:400])
-            return ("unavailable" if plan_disabled else "available"), detail
-    return "error", f"{TARGET_DAY}日のボタンが見つかりません"
+    # 日付自体が満席なら、どの方向も空いていない
+    if disabled or "sold-out" in icon_cls:
+        if debug:
+            dump(page)
+        return "unavailable", day_detail
+
+    # 日付を選ぶと、進行方向ボタンが出て、有効/無効が切り替わる
+    try:
+        day_btn.click(timeout=5000)
+        plan_btn = page.get_by_role("button", name=PLAN_PATTERN)
+        plan_btn.first.wait_for(state="visible", timeout=15000)  # 固定の秒数ではなく、出るまで待つ
+        page.wait_for_timeout(1500)  # 押せる/押せないの状態が確定するのを待つ
+        plan = plan_btn.first
+        plan_disabled = looks_disabled(plan)
+    except Exception as e:
+        if debug:
+            dump(page, "(進行方向ボタンの確認に失敗)")
+        raise DirectionCheckFailed(day_detail, f"{type(e).__name__}: {str(e)[:120]}")
+
+    detail = f"{day_detail} / 嵯峨・嵐山→亀岡ボタン: {'押せない(満席)' if plan_disabled else '押せる(空きあり)'}"
+    if debug:
+        dump(page)
+        print(detail)
+        print("ボタンのHTML:", plan.evaluate("el => el.outerHTML")[:400])
+        reverse = page.get_by_role("button", name=re.compile(r"亀岡駅.{0,6}嵯峨駅"))
+        if reverse.count():
+            print("(参考)逆方向のボタンのHTML:", reverse.first.evaluate("el => el.outerHTML")[:400])
+    return ("unavailable" if plan_disabled else "available"), detail
+
+
+def check(page, debug=False):
+    """戻り値: (status, detail)  status = 'available' | 'unavailable' | 'error'
+
+    一時的な失敗に備えて、最大3回やり直す。
+    それでも「日付は押せる(○/△)のに方向が確認できない」場合は、見逃さないよう
+    『空きの可能性あり(要確認)』として通知する。
+    """
+    last_error = ""
+    direction_failed = None
+    for attempt in range(1, 4):
+        try:
+            return check_once(page, debug=debug)
+        except DirectionCheckFailed as e:
+            direction_failed = e
+            last_error = e.reason
+            print(f"[retry {attempt}/3] 進行方向の確認に失敗: {e.reason}")
+        except Exception as e:
+            direction_failed = None
+            last_error = str(e)[:150]
+            print(f"[retry {attempt}/3] 失敗: {last_error}")
+        page.wait_for_timeout(3000)
+
+    if direction_failed is not None:
+        # 日付が○/△なのに方向を確認できなかった → 空きを見逃さないため通知する
+        return "available", f"(要確認)進行方向の確認に失敗しましたが、{direction_failed.day_detail}。予約ページを確認してください"
+    return "error", last_error
 
 
 def main():
