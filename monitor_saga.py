@@ -23,7 +23,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ===== 設定 =====
 URL = "https://ars-saganokanko.triplabo.jp/activity/ja/LINKTIVITY-YRBTL"
 TARGET_YEAR, TARGET_MONTH, TARGET_DAY = 2026, 11, 25
-LABEL = f"嵯峨野トロッコ {TARGET_MONTH}/{TARGET_DAY} 嵯峨・嵐山→亀岡"
+LABEL = f"嵯峨野トロッコ {TARGET_MONTH}/{TARGET_DAY} 嵯峨→亀岡"
 # 選びたいプラン名にマッチする正規表現(全角スラッシュ/矢印の表記ゆれに対応)
 PLAN_PATTERN = re.compile(r"嵯峨駅.{0,6}嵐山駅.{0,12}亀岡駅", re.S)
 INTERVAL_SEC = 300
@@ -200,8 +200,143 @@ def check(page, debug=False):
     return "error", last_error
 
 
+# ===== 空きが出たとき: 時間・座席の取得 =====
+# 予約画面(座席選択)は別のアドレスにあり、ログインなしで直接開ける(動作確認済み)。
+# 大人1名(unitsCount=1)、嵯峨発 → 亀岡着、で空いているすべての列車と座席を調べる。
+SEAT_URL = (f"https://file.sagano.linktivity.io/seat/51/down?lang=ja"
+            f"&date={TARGET_YEAR}-{TARGET_MONTH:02d}-{TARGET_DAY:02d}&unitsCount=1")
+BOARDING_STATIONS = ["トロッコ嵯峨"]                  # 乗車駅(嵯峨発のみ。嵐山発も見たければ "トロッコ嵐山" を足す)
+ALIGHT_STATION = "トロッコ亀岡"                       # 降車駅
+MAX_TRAINS = 12                                       # 座席まで調べる列車の最大数(1日10本ほどなので、全部入る)
+MAX_MESSAGE_CHARS = 3500                              # LINE1通の上限(5000字)に収まるようにする
+COMBO_SEL = "div[role='combobox'][aria-haspopup='listbox']"
+TRAIN_SEL = "button[class*='_train_']"
+
+# 号車ごとに座席画面を開き、押せる(空いている)座席を「行+席」(例: 1C)で集める
+READ_CARS_JS = r"""
+async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const heads = () => [...document.querySelectorAll("button, div[role='button'], summary")]
+      .filter(e => /^\s*[1-9]\d*号車/.test(e.innerText));
+  const out = {};
+  const total = heads().length;
+  for (let c = 1; c <= total; c++) {
+    const h = heads().find(e => e.innerText.trim().startsWith(c + '号車'));
+    if (!h) continue;
+    h.click();
+    await sleep(1200);
+    const free = [];
+    for (const b of document.querySelectorAll('button')) {
+      if (!/^[A-D]$/.test(b.innerText.trim()) || b.disabled) continue;
+      let n = b.parentElement, hops = 0;
+      while (n && !/^\s*\d+\s/.test(n.innerText) && hops < 6) { n = n.parentElement; hops++; }
+      const row = n ? n.innerText.trim().split(/\s+/)[0] : '?';
+      free.push(row + b.innerText.trim());
+    }
+    out[c] = free;
+  }
+  return out;
+}
+"""
+
+
+def pick_station(page, index, name):
+    """乗車駅(index=0)/降車駅(index=1)のプルダウンから駅を選ぶ。"""
+    page.locator(COMBO_SEL).nth(index).click(timeout=8000)
+    page.get_by_role("option", name=name, exact=True).click(timeout=8000)
+    page.wait_for_timeout(800)
+
+
+def open_train_list(page, boarding):
+    """座席画面を開き、乗車駅→降車駅を選んで、列車の一覧を出す。"""
+    page.goto(SEAT_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_selector(COMBO_SEL, timeout=30000)
+    page.wait_for_timeout(1000)
+    pick_station(page, 0, boarding)
+    pick_station(page, 1, ALIGHT_STATION)
+    page.wait_for_selector(TRAIN_SEL, timeout=20000)
+    page.wait_for_timeout(1000)
+
+
+def list_trains(page):
+    """列車の一覧。[{index, dep, arr, name, free}]  (free=押せる=空席あり)"""
+    trains = []
+    btns = page.locator(TRAIN_SEL)
+    for i in range(btns.count()):
+        b = btns.nth(i)
+        text = b.inner_text()
+        times = re.findall(r"\d{1,2}:\d{2}", text)
+        name = re.search(r"\S+号", text)
+        trains.append({
+            "index": i,
+            "dep": times[0] if times else "?",
+            "arr": times[1] if len(times) > 1 else "?",
+            "name": name.group(0) if name else "?",
+            "free": not b.is_disabled(),
+        })
+    return trains
+
+
+def fetch_seat_details(ctx):
+    """空いているすべての列車(発車時刻)と、号車ごとの空席番号を調べる。
+    戻り値: (state, 文章)
+      state = "free"    : 空きのある列車がある
+              "none"    : 列車の一覧は確認できたが、空きのある列車はない
+              "unknown" : 確認に失敗した(見逃さないよう、呼び出し側では「空きあり」として扱う)
+    """
+    lines = [f"【{TARGET_MONTH}/{TARGET_DAY} 大人1名・嵯峨発→亀岡着】"]
+    found_free = False
+    failed = False
+    page = ctx.new_page()
+    page.set_viewport_size({"width": 480, "height": 900})
+    try:
+        for boarding in BOARDING_STATIONS:
+            try:
+                open_train_list(page, boarding)
+                trains = list_trains(page)
+            except Exception as e:
+                failed = True
+                lines.append(f"{boarding}発: 列車の一覧の取得に失敗({type(e).__name__})")
+                continue
+            all_free = [t for t in trains if t["free"]]
+            if not all_free:
+                lines.append(f"{boarding}発: 空きのある列車はありません")
+                continue
+            found_free = True
+            if len(BOARDING_STATIONS) > 1:
+                lines.append(f"■{boarding}発")
+            if len(all_free) > MAX_TRAINS:
+                lines.append(f"(空きのある列車が{len(all_free)}本あります。先頭の{MAX_TRAINS}本を表示)")
+            for t in all_free[:MAX_TRAINS]:
+                head = f"■{t['dep']}発 {t['name']}(→{t['arr']}着)"
+                try:
+                    open_train_list(page, boarding)
+                    page.locator(TRAIN_SEL).nth(t["index"]).click(timeout=8000)
+                    page.get_by_role("button", name="次へ", exact=True).click(timeout=8000)
+                    page.get_by_text("1号車").first.wait_for(timeout=20000)
+                    cars = page.evaluate(READ_CARS_JS)
+                except Exception as e:
+                    lines.append(f"{head}: 座席の取得に失敗({type(e).__name__})")
+                    continue
+                total = sum(len(s) for s in cars.values())
+                lines.append(f"{head} 空席{total}席")
+                seat_lines = [f"  {car}号車: {' '.join(seats)}"
+                              for car, seats in cars.items() if seats]
+                lines.extend(seat_lines or ["  (空いている座席を確認できませんでした)"])
+    finally:
+        page.close()
+
+    text = "\n".join(lines)
+    if len(text) > MAX_MESSAGE_CHARS:
+        text = text[:MAX_MESSAGE_CHARS] + "\n…(長いため以降は省略。予約ページで確認してください)"
+    state = "free" if found_free else ("unknown" if failed else "none")
+    return state, text
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--seat-info", action="store_true",
+                    help="時間・座席の取得だけ試して表示(通知はしない。動作確認用)")
     ap.add_argument("--debug", action="store_true", help="1回だけ実行し、画面を保存")
     ap.add_argument("--headed", action="store_true", help="ブラウザを表示して動作確認")
     ap.add_argument("--test-notify", action="store_true", help="通知のテスト送信だけして終了")
@@ -215,6 +350,16 @@ def main():
         return
     if args.test_notify:
         notify("通知テスト", f"{LABEL} の監視の通知テストです")
+        return
+
+    if args.seat_info:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=not args.headed)
+            ctx = browser.new_context(locale="ja-JP")
+            state, text = fetch_seat_details(ctx)
+            print(text)
+            print(f"(判定: {state})")
+            browser.close()
         return
 
     has_line = bool(LINE_TOKEN and LINE_USER_ID)
@@ -239,13 +384,31 @@ def main():
                 status, detail = "error", str(e)[:200]
                 if args.debug:
                     dump(page, "(例外)")
+            seat_text = ""
+            if status == "available":
+                # 空きが出たら、何時の列車のどの座席が空いているかも調べる(失敗しても通知は送る)
+                try:
+                    seat_state, seat_text = fetch_seat_details(ctx)
+                except Exception as e:
+                    seat_state, seat_text = "unknown", f"(時間・座席の取得に失敗しました: {type(e).__name__})"
+                if seat_state == "none":
+                    # 日付・方向としては空きでも、嵯峨発に空きの列車がなければ通知しない
+                    # (空きが嵐山発だけの場合など)
+                    status = "unavailable"
+                    detail = f"{detail} / ただし嵯峨発の空きなし"
             print(f"[{ts}] {status}  {detail}")
+            if seat_text:
+                print(seat_text)
 
             if status == "available":
                 if args.once:
+                    # GitHub Actions側で、回数を数えながら繰り返し通知する(文面は seat_info.txt 経由で渡す)
+                    with open("seat_info.txt", "w", encoding="utf-8") as f:
+                        f.write(seat_text)
                     browser.close()
                     raise SystemExit(10)
-                notify(f"🎉 {LABEL} に空きが出ました", f"今すぐ予約ページを開いてください! ({detail})")
+                notify(f"🎉 {LABEL} に空きが出ました",
+                       f"今すぐ予約ページを開いてください!\n({detail})\n{seat_text}")
                 break
             if args.once:
                 browser.close()
