@@ -22,7 +22,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ===== 設定 =====
 URL = "https://ars-saganokanko.triplabo.jp/activity/ja/LINKTIVITY-YRBTL"
-TARGET_YEAR, TARGET_MONTH, TARGET_DAY = 2026, 11, 18
+TARGET_YEAR, TARGET_MONTH, TARGET_DAY = 2026, 11, 25
 LABEL = f"嵯峨野トロッコ {TARGET_MONTH}/{TARGET_DAY} 嵯峨→亀岡"
 # 選びたいプラン名にマッチする正規表現(全角スラッシュ/矢印の表記ゆれに対応)
 PLAN_PATTERN = re.compile(r"嵯峨駅.{0,6}嵐山駅.{0,12}亀岡駅", re.S)
