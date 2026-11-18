@@ -15,12 +15,12 @@ permissions:
 
 env:
   MAX_ALERTS: "30"           # 空きを検知している間、LINEを送る最大回数(上限に達したら監視を停止)
-  LABEL: "嵯峨野トロッコ 11/25 嵯峨・嵐山→亀岡"
+  LABEL: "嵯峨野トロッコ 11/25 嵯峨→亀岡"
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +65,9 @@ jobs:
           # ---- 空きあり: 回数を数えながら、繰り返しLINE通知 ----
           if [ "$code" -eq 10 ]; then
             count=$((count + 1))
-            python monitor_saga.py --send "🎉 ${LABEL} に空きが出ました(${count}回目の通知)" "今すぐ予約ページを開いてください!予約できたら、GitHubのActionsで watch_saga を Disable してください。"
+            seat=$(cat seat_info.txt 2>/dev/null)
+            msg=$(printf '%s\n%s\n%s' "今すぐ予約ページを開いてください!" "$seat" "予約できたら、GitHubのActionsで watch_saga を Disable してください。")
+            python monitor_saga.py --send "🎉 ${LABEL} に空きが出ました(${count}回目の通知)" "$msg"
             save_count "$count"
             if [ "$count" -ge "$MAX_ALERTS" ]; then
               python monitor_saga.py --send "通知の上限に達しました(嵯峨野トロッコ)" "LINEの送信数節約のため、監視を停止します。もう一度始める場合は Actions の watch_saga を Enable してください。"
